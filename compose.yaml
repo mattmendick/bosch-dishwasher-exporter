@@ -1,0 +1,19 @@
+services:
+  exporter:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "9809:9809"
+    volumes:
+      - tokens:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  tokens:
