@@ -33,6 +33,29 @@ and refresh automatically. Don't run authorization and the exporter concurrently
 stop the exporter before reauthorizing. `docker compose down -v` deletes tokens.
 The container runs as non-root UID 10001.
 
+## Update and redeploy
+
+Run from the project directory:
+
+```sh
+./update.sh
+```
+
+The script pulls the latest Git changes (fast-forward only), builds the image with
+an updated base image, and recreates the service as needed. It preserves the
+existing `tokens` volume, so you don't need to authorize again. It stops on errors
+and leaves the running service in place if pulling or building fails. You can also
+invoke the script by its full path from another directory.
+
+To rebuild and deploy manually without pulling Git changes:
+
+```sh
+docker compose up -d --build
+```
+
+To only build the image, use `docker compose build`. These commands don't remove
+the auth volume; don't use `docker compose down -v` during updates.
+
 ## Prometheus
 
 ```yaml
