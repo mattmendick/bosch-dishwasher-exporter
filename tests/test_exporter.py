@@ -1,15 +1,17 @@
 import json
 from io import BytesIO
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
 from prometheus_client import CollectorRegistry, generate_latest
 
-from exporter import APIError, Client, Collector, PREFIX
+from exporter import APIError, Client, Collector, PREFIX, ResyncRequired, monitor, sse_frames
 
 
 class ExporterTests(unittest.TestCase):
@@ -172,6 +174,163 @@ class ExporterTests(unittest.TestCase):
         self.assertIn("status=503", logs.output[0])
         self.assertIn("No JSON error details", logs.output[0])
         self.assertNotIn("private proxy response", logs.output[0])
+
+    def test_saved_rate_limit_blocks_network_after_restart(self):
+        client = self.client()
+        error = HTTPError("https://api.home-connect.com/api/homeappliances/events", 429,
+                          "Limited", {"Retry-After": "10828"}, BytesIO(b'{"error":{"key":"429"}}'))
+        with patch("exporter.time.time", return_value=1000), patch("exporter.urlopen", side_effect=error):
+            with self.assertLogs("exporter"), self.assertRaises(APIError):
+                client.events()
+        restarted = Client()
+        with patch("exporter.time.time", return_value=1100), patch("exporter.urlopen") as network:
+            with self.assertRaises(APIError) as error:
+                restarted.events()
+        self.assertEqual(error.exception.retry_after, 10728)
+        network.assert_not_called()
+
+    def test_sse_parser_handles_multiline_data_heartbeats_and_ids(self):
+        stream = BytesIO(b': heartbeat\r\n\r\nevent: KEEP-ALIVE\n\n'
+                         b'event: NOTIFY\nid: dishwasher\ndata: {"items":\ndata: []}\n\n')
+        frames = sse_frames(stream, threading.Event())
+        self.assertEqual(next(frames), ("KEEP-ALIVE", "", ""))
+        self.assertEqual(next(frames), ("KEEP-ALIVE", "", ""))
+        self.assertEqual(next(frames), ("NOTIFY", "dishwasher", '{"items":\n[]}'))
+        with self.assertRaises(ConnectionError):
+            next(frames)
+
+    def event_collector(self):
+        collector = Collector(Mock())
+        with patch("exporter.time.time", return_value=1000):
+            self.poll(collector)
+        return collector
+
+    def send(self, collector, key, value, timestamp=1010, kind="NOTIFY"):
+        collector.event(kind, "dishwasher", json.dumps({"items": [
+            {"key": PREFIX + key, "value": value, "timestamp": timestamp}]}))
+
+    def test_event_timestamp_and_out_of_order_updates(self):
+        collector = self.event_collector()
+        self.send(collector, "Option.RemainingProgramTime", 60)
+        self.assertEqual(collector.snapshot[0]["finish"], 1070)
+        self.send(collector, "Option.RemainingProgramTime", 999, 1005)
+        self.assertEqual(collector.snapshot[0]["finish"], 1070)
+        self.assertEqual(collector.client.get.call_count, 3)
+
+    def test_finish_pause_and_disconnect_remove_old_metrics(self):
+        for key, value in [
+            ("Status.OperationState", PREFIX + "EnumType.OperationState.Pause"),
+            ("Event.ProgramFinished", PREFIX + "EnumType.EventPresentState.Present"),
+            ("Event.ProgramAborted", PREFIX + "EnumType.EventPresentState.Present"),
+        ]:
+            collector = self.event_collector()
+            self.send(collector, key, value)
+            self.assertFalse(collector.snapshot[0]["running"])
+            self.assertNotIn("finish", collector.snapshot[0])
+            self.send(collector, "Option.RemainingProgramTime", 90, 1005)
+            self.assertNotIn("finish", collector.snapshot[0])
+        collector.event("DISCONNECTED", "dishwasher", "")
+        self.assertFalse(collector.snapshot[0]["connected"])
+        self.assertNotIn("running", collector.snapshot[0])
+        with self.assertRaises(ResyncRequired):
+            collector.event("CONNECTED", "dishwasher", "")
+
+    def test_timing_before_run_is_retained_but_not_exposed_while_idle(self):
+        collector = self.event_collector()
+        self.send(collector, "Status.OperationState", PREFIX + "EnumType.OperationState.Ready", 1010)
+        self.send(collector, "Option.RemainingProgramTime", 60, 1020)
+        self.assertNotIn("finish", collector.snapshot[0])
+        self.send(collector, "Status.OperationState", PREFIX + "EnumType.OperationState.Run", 1020)
+        self.assertEqual(collector.snapshot[0]["finish"], 1080)
+
+    def test_duplicate_connected_does_not_resync_and_depaired_removes_device(self):
+        collector = self.event_collector()
+        collector.event("CONNECTED", "dishwasher", "")
+        collector.event("DEPAIRED", "dishwasher", "")
+        self.assertEqual(collector.snapshot, [])
+
+    def test_monitor_snapshot_after_open_and_eof_backoff(self):
+        client = Mock()
+        client.tokens = {"expires_at": float("inf")}
+        response = BytesIO(b"event: KEEP-ALIVE\n\n")
+        client.events.return_value = response
+        collector = Mock()
+        calls = []
+        client.events.side_effect = lambda: (calls.append("open") or response)
+        collector.poll.side_effect = lambda: calls.append("snapshot")
+        stop = threading.Event()
+        with patch.object(stop, "wait", side_effect=lambda delay: stop.set()) as wait:
+            with self.assertLogs("exporter"):
+                monitor(client, collector, stop)
+        self.assertEqual(calls, ["open", "snapshot"])
+        collector.event.assert_called_once_with("KEEP-ALIVE", "", "")
+        collector.fail.assert_called_once()
+        self.assertTrue(response.closed)
+        wait.assert_called_once_with(60)
+
+    def test_monitor_honors_retry_after_without_snapshot(self):
+        client, collector = Mock(), Mock()
+        client.events.side_effect = APIError(429, "429", 10828)
+        stop = threading.Event()
+        with patch.object(stop, "wait", side_effect=lambda delay: stop.set()) as wait:
+            with self.assertLogs("exporter"):
+                monitor(client, collector, stop)
+        wait.assert_called_once_with(10828)
+        collector.poll.assert_not_called()
+        collector.fail.assert_called_once()
+
+    def test_real_http_stream_and_snapshot_integration(self):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                requests.append((self.path, self.headers.get("Accept")))
+                if self.path.endswith("/events"):
+                    body = (b'event: NOTIFY\nid: dishwasher\n'
+                            b'data: {"items":[{"key":"BSH.Common.Option.RemainingProgramTime",'
+                            b'"value":60,"timestamp":1010}]}\n\n')
+                    content_type = "text/event-stream"
+                else:
+                    content_type = "application/json"
+                    data = {
+                        "/api/homeappliances": {"homeappliances": [
+                            {"haId": "dishwasher", "type": "Dishwasher", "connected": True}]},
+                        "/api/homeappliances/dishwasher/status": {"status": [
+                            {"key": PREFIX + "Status.OperationState", "value": PREFIX + "EnumType.OperationState.Run"}]},
+                        "/api/homeappliances/dishwasher/programs/active": {"options": [
+                            {"key": PREFIX + "Option.RemainingProgramTime", "value": 120}]},
+                    }[self.path]
+                    body = json.dumps({"data": data}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = self.client()
+            collector = Collector(client)
+            with patch("exporter.BASE", f"http://127.0.0.1:{server.server_port}"), patch("exporter.time.time", return_value=1000):
+                with client.events() as response:
+                    collector.poll()
+                    frames = sse_frames(response, threading.Event())
+                    collector.event(*next(frames))
+                    self.assertEqual(collector.snapshot[0]["finish"], 1070)
+                    with self.assertRaises(ConnectionError):
+                        next(frames)
+            self.assertEqual(requests[0], ("/api/homeappliances/events", "text/event-stream"))
+            self.assertEqual(len(requests), 4)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
 
 if __name__ == "__main__":

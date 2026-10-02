@@ -71,31 +71,53 @@ If Prometheus shares the Compose network, use `exporter:9809`.
 
 | Metric | Meaning |
 | --- | --- |
-| `bosch_dishwasher_exporter_up` | 1 if the latest API poll succeeded, else 0 |
+| `bosch_dishwasher_exporter_up` | 1 while monitoring is healthy, else 0 |
+| `bosch_dishwasher_event_stream_connected` | 1 while the event stream is connected and initialized |
 | `bosch_dishwasher_connected{appliance_id}` | Appliance connected to Home Connect |
 | `bosch_dishwasher_running{appliance_id}` | Actively running; 0 when paused, delayed, or idle |
-| `bosch_dishwasher_remaining_seconds{appliance_id}` | Remaining seconds reported at last poll |
+| `bosch_dishwasher_remaining_seconds{appliance_id}` | Remaining seconds reported at last snapshot/event |
 | `bosch_dishwasher_estimated_finish_timestamp_seconds{appliance_id}` | Unix finish timestamp calculated from the latest remaining time |
-| `bosch_dishwasher_last_successful_update_timestamp_seconds` | Unix timestamp of last successful API poll |
+| `bosch_dishwasher_last_successful_update_timestamp_seconds` | Unix timestamp of last snapshot, event, or heartbeat |
 
 Remaining and finish metrics are omitted when idle, paused, disconnected, or not
-reported by the device. Running is omitted when disconnected. Failed polls remove
+reported by the device. Running is omitted when disconnected. Stream failures remove
 appliance samples, set exporter_up to 0, and retain the last-success timestamp.
-A disconnected appliance is a successful API poll, not an exporter failure.
+A disconnected appliance isn't an exporter failure if the event stream is healthy.
 The complete snapshot is replaced atomically, including when a device is unpaired.
 
-Scrapes read cached data, never call Home Connect. Polling defaults to **300 seconds**:
-one discovery request plus one status request per connected dishwasher, and one
-active-program request per running dishwasher. Thus a single continuously running
-dishwasher uses about 864 REST requests/day, plus OAuth requests. Consider the API
-quota before reducing the interval or monitoring multiple devices. Errors use
-exponential backoff and honor numeric `Retry-After` values. This first version uses
-polling rather than a persistent event stream; cycle changes can take up to one poll
-interval to appear. Estimates may change during a cycle and aren't completion events.
+Scrapes read cached data, never call Home Connect. Monitoring uses **one persistent
+server-sent events (SSE) connection** to `/api/homeappliances/events` for the account.
+At startup and after reconnecting, it reads a snapshot: one discovery request,
+one status request per connected dishwasher, and one program request per running
+dishwasher. It opens the stream before fetching the snapshot to buffer changes
+during initialization. Ordinary status/timing events don't trigger REST requests.
+
+Opening the stream counts as one request; events and keep-alives don't consume
+the request quota. A stable connection therefore uses only a handful of requests
+per day for a single dishwasher, rather than hundreds. Network outages and device
+reconnections add requests. The stream is renewed around token expiry; a read
+timeout of 90 seconds detects missing heartbeats. Reconnection failures back off
+from 60 seconds to one hour, resetting after a session lasts at least five minutes.
+Numeric `Retry-After` values take precedence when longer. HTTP 429 cooldowns are
+saved alongside tokens and honored after restarting the container.
+
+Program completion, pause, disconnect, and unpair events clear obsolete metrics.
+Appliance reconnection or pairing causes a fresh snapshot after backoff. Finish
+estimates use the event timestamp plus remaining seconds, not the receipt time;
+older per-field notifications are ignored. Estimates can still change mid-cycle.
+
+### Upgrading from polling
+
+Existing tokens, scopes, and the Docker volume work unchanged; no reauthorization
+is required. `POLL_INTERVAL_SECONDS` is now ignored and can be removed from `.env`.
+Deploy with `./update.sh` once the changes are available in your Git remote.
+If already quota-blocked, the exporter must still wait for the existing block to
+expire before establishing its first stream. The old polling version didn't save
+cooldowns, so the first upgraded request may receive one more 429 and save its delay.
 
 Unsuccessful HTTP requests log the method, endpoint, HTTP status, API error code,
 API error description, and raw `Retry-After` value (or `not provided`). For example,
-`status=429` indicates rate limiting; the following poll-failure log shows the actual
+`status=429` indicates rate limiting; the following monitoring-failure log shows the actual
 retry delay after backoff. OAuth failures are logged too. Credentials are redacted,
 and raw response bodies and authorization headers aren't logged.
 
@@ -105,13 +127,13 @@ block after 10 successive errors within 10 minutes. Failed requests and retries
 count toward quotas. A 429 doesn't necessarily mean the daily quota was reached:
 check its description and `Retry-After` in `docker compose logs -f exporter`.
 
-For a countdown between polls, use PromQL:
+For a countdown between events, use PromQL:
 
 ```promql
 clamp_min(bosch_dishwasher_estimated_finish_timestamp_seconds - time(), 0)
 ```
 
-For data age:
+For monitoring activity age (includes keep-alives, not just appliance changes):
 
 ```promql
 time() - bosch_dishwasher_last_successful_update_timestamp_seconds
@@ -124,7 +146,6 @@ time() - bosch_dishwasher_last_successful_update_timestamp_seconds
 | `HOME_CONNECT_CLIENT_ID` | Required |
 | `HOME_CONNECT_CLIENT_SECRET` | Optional; used for refresh when provided |
 | `HOME_CONNECT_APPLIANCE_ID` | All dishwashers |
-| `POLL_INTERVAL_SECONDS` | 300 (minimum 60) |
 | `TOKEN_FILE` | `data/tokens.json`, `/data/tokens.json` in Docker |
 | `PORT` | 9809 (update Compose port mapping if changed) |
 
