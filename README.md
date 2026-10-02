@@ -70,6 +70,18 @@ exponential backoff and honor numeric `Retry-After` values. This first version u
 polling rather than a persistent event stream; cycle changes can take up to one poll
 interval to appear. Estimates may change during a cycle and aren't completion events.
 
+Unsuccessful HTTP requests log the method, endpoint, HTTP status, API error code,
+API error description, and raw `Retry-After` value (or `not provided`). For example,
+`status=429` indicates rate limiting; the following poll-failure log shows the actual
+retry delay after backoff. OAuth failures are logged too. Credentials are redacted,
+and raw response bodies and authorization headers aren't logged.
+
+[Home Connect's rate limits](https://api-docs.home-connect.com/general/#rate-limiting)
+include 1,000 requests per client/account per day, 50 per minute, and a 10-minute
+block after 10 successive errors within 10 minutes. Failed requests and retries
+count toward quotas. A 429 doesn't necessarily mean the daily quota was reached:
+check its description and `Retry-After` in `docker compose logs -f exporter`.
+
 For a countdown between polls, use PromQL:
 
 ```promql

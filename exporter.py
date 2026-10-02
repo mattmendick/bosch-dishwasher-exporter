@@ -54,15 +54,44 @@ class Client:
             with urlopen(Request(BASE + path, data=body, headers=headers), timeout=30) as response:
                 return json.load(response)
         except HTTPError as exc:
+            description = "No JSON error details returned"
             try:
-                error = json.loads(exc.read()).get("error", {})
+                payload = json.loads(exc.read())
+                error = payload.get("error", {})
                 key = error if isinstance(error, str) else error.get("key", "unknown")
-            except (ValueError, AttributeError):
+                description = (payload.get("error_description", "") if isinstance(error, str)
+                               else error.get("description", ""))
+            except (ValueError, AttributeError, TypeError):
                 key = "unknown"
+            retry_after = exc.headers.get("Retry-After", "")
             try:
-                delay = max(0, float(exc.headers.get("Retry-After", "0")))
+                delay = float(retry_after or "0")
+                if not math.isfinite(delay) or delay < 0:
+                    delay = 0
             except ValueError:
                 delay = 0
+            # Log only selected diagnostics, never raw bodies or auth headers.
+            # Redact credentials even if an upstream error echoes them back.
+            secrets = [self.client_id, self.secret, token,
+                       self.tokens.get("access_token"), self.tokens.get("refresh_token"),
+                       self.tokens.get("id_token")]
+            if form:
+                secrets.extend(value for name, value in form.items()
+                               if name in {"client_id", "client_secret", "device_code", "refresh_token"})
+
+            def safe(value):
+                text = str(value)
+                for secret in secrets:
+                    if secret:
+                        text = text.replace(str(secret), "[redacted]")
+                return " ".join(text.split())[:500]
+
+            LOG.warning(
+                "Home Connect request failed: method=%s endpoint=%s status=%s "
+                "error=%s description=%s retry_after=%s",
+                "POST" if form is not None else "GET", safe(path.split("?", 1)[0]),
+                exc.code, safe(key), safe(description), safe(retry_after) or "not provided",
+            )
             raise APIError(exc.code, key, delay) from None
 
     def save(self, result):

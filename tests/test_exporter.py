@@ -1,8 +1,10 @@
 import json
+from io import BytesIO
 import os
 from pathlib import Path
 import tempfile
 import unittest
+from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
 from prometheus_client import CollectorRegistry, generate_latest
@@ -128,6 +130,48 @@ class ExporterTests(unittest.TestCase):
         with patch("exporter.time.sleep"), patch("builtins.print"), self.assertRaises(APIError):
             client.authorize()
         self.assertFalse(self.path.exists())
+
+    def test_rate_limit_logs_diagnostics_and_preserves_backoff(self):
+        client = self.client()
+        body = {"error": {"key": "429", "description": "Daily request limit reached"}}
+        error = HTTPError("https://api.home-connect.com/api/homeappliances", 429,
+                          "Too Many Requests", {"Retry-After": "3600"}, BytesIO(json.dumps(body).encode()))
+        with patch("exporter.urlopen", side_effect=error), self.assertLogs("exporter", level="WARNING") as logs:
+            with self.assertRaises(APIError) as raised:
+                client.request("/api/homeappliances", token="old")
+        self.assertEqual(raised.exception.retry_after, 3600)
+        self.assertEqual(raised.exception.status, 429)
+        message = logs.output[0]
+        for expected in ["method=GET", "endpoint=/api/homeappliances", "status=429",
+                         "error=429", "Daily request limit reached", "retry_after=3600"]:
+            self.assertIn(expected, message)
+
+    def test_oauth_error_redacts_credentials_and_newlines(self):
+        client = self.client()
+        body = {"error": "invalid_grant", "error_description":
+                "test-secret refresh-old test-client device-value\nrejected"}
+        error = HTTPError("https://api.home-connect.com/security/oauth/token",
+                          400, "Bad Request", {}, BytesIO(json.dumps(body).encode()))
+        with patch("exporter.urlopen", side_effect=error), self.assertLogs("exporter", level="WARNING") as logs:
+            with self.assertRaises(APIError):
+                client.request("/security/oauth/token", form={"device_code": "device-value"})
+        message = logs.output[0]
+        self.assertIn("error=invalid_grant", message)
+        self.assertIn("[redacted]", message)
+        for secret in ["test-secret", "refresh-old", "test-client", "device-value", "\n"]:
+            self.assertNotIn(secret, message)
+
+    def test_non_json_error_and_invalid_retry_after(self):
+        client = self.client()
+        error = HTTPError("https://api.home-connect.com/api/homeappliances", 503,
+                          "Unavailable", {"Retry-After": "invalid"}, BytesIO(b"private proxy response"))
+        with patch("exporter.urlopen", side_effect=error), self.assertLogs("exporter", level="WARNING") as logs:
+            with self.assertRaises(APIError) as raised:
+                client.request("/api/homeappliances")
+        self.assertEqual(raised.exception.retry_after, 0)
+        self.assertIn("status=503", logs.output[0])
+        self.assertIn("No JSON error details", logs.output[0])
+        self.assertNotIn("private proxy response", logs.output[0])
 
 
 if __name__ == "__main__":
